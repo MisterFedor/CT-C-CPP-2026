@@ -1,0 +1,29 @@
+%%MatrixMarket matrix array real general
+% generated test
+% random matrix
+5 5
+3
+4
+3
+2
+3
+2
+1
+5
+4
+5
+5
+3
+4
+2
+3
+0
+3
+0
+2
+2
+5
+4
+3
+1
+3

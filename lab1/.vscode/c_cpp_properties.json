@@ -1,0 +1,17 @@
+{
+  "configurations": [
+    {
+      "name": "Win64",
+      "compilerPath": "clang.exe",
+      "intelliSenseMode": "windows-clang-x64",
+      "cStandard": "c17",
+      "cppStandard": "c++23",
+      "includePath": ["${workspaceFolder}/include"],
+      "defines": ["DEBUG", "MY_FEATURE=1", "_CRT_SECURE_NO_WARNINGS"],
+      "browse": {
+        "path": ["${myIncludePath}", "${workspaceFolder}"]
+      }
+    }
+  ],
+  "version": 4
+}

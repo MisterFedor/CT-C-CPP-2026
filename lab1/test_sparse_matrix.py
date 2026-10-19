@@ -1,0 +1,1034 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import argparse
+import math
+import os
+import random
+import shutil
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+EPS = 1e-4
+DEFAULT_SEED = 123456789
+
+
+# =========================
+# Utilities
+# =========================
+
+def is_zero(x: float, eps: float = EPS) -> bool:
+    return abs(x) <= eps
+
+
+def canonicalize_entries(entries: Dict[Tuple[int, int], float], eps: float = EPS) -> Dict[Tuple[int, int], float]:
+    result = {}
+    for key, value in entries.items():
+        if not is_zero(value, eps):
+            result[key] = float(value)
+    return result
+
+
+def dense_to_entries(dense: List[List[float]], eps: float = EPS) -> Dict[Tuple[int, int], float]:
+    rows = len(dense)
+    cols = len(dense[0]) if rows else 0
+    result = {}
+    for r in range(rows):
+        for c in range(cols):
+            if not is_zero(dense[r][c], eps):
+                result[(r, c)] = float(dense[r][c])
+    return result
+
+
+def entries_to_dense(rows: int, cols: int, entries: Dict[Tuple[int, int], float]) -> List[List[float]]:
+    dense = [[0.0 for _ in range(cols)] for _ in range(rows)]
+    for (r, c), v in entries.items():
+        dense[r][c] += v
+    return dense
+
+
+def mat_add(a: List[List[float]], b: List[List[float]]) -> List[List[float]]:
+    rows = len(a)
+    cols = len(a[0]) if rows else 0
+    return [[a[r][c] + b[r][c] for c in range(cols)] for r in range(rows)]
+
+
+def mat_sub(a: List[List[float]], b: List[List[float]]) -> List[List[float]]:
+    rows = len(a)
+    cols = len(a[0]) if rows else 0
+    return [[a[r][c] - b[r][c] for c in range(cols)] for r in range(rows)]
+
+
+def mat_mul(a: List[List[float]], b: List[List[float]]) -> List[List[float]]:
+    rows = len(a)
+    inner = len(a[0]) if rows else 0
+    cols = len(b[0]) if b else 0
+    result = [[0.0 for _ in range(cols)] for _ in range(rows)]
+    for i in range(rows):
+        for k in range(inner):
+            aik = a[i][k]
+            if is_zero(aik):
+                continue
+            for j in range(cols):
+                result[i][j] += aik * b[k][j]
+    return result
+
+
+def mat_eye(n: int) -> List[List[float]]:
+    result = [[0.0 for _ in range(n)] for _ in range(n)]
+    for i in range(n):
+        result[i][i] = 1.0
+    return result
+
+
+def mat_pow(a: List[List[float]], deg: int) -> List[List[float]]:
+    n = len(a)
+    result = mat_eye(n)
+    base = [row[:] for row in a]
+    p = deg
+    while p > 0:
+        if p & 1:
+            result = mat_mul(result, base)
+        base = mat_mul(base, base)
+        p >>= 1
+    return result
+
+
+def mat_det(a: List[List[float]]) -> float:
+    n = len(a)
+    m = [row[:] for row in a]
+    det = 1.0
+    sign = 1.0
+
+    for col in range(n):
+        pivot = col
+        while pivot < n and is_zero(m[pivot][col]):
+            pivot += 1
+        if pivot == n:
+            return 0.0
+        if pivot != col:
+            m[col], m[pivot] = m[pivot], m[col]
+            sign *= -1.0
+
+        pivot_value = m[col][col]
+        det *= pivot_value
+        if is_zero(pivot_value):
+            return 0.0
+
+        for row in range(col + 1, n):
+            factor = m[row][col] / pivot_value
+            if is_zero(factor):
+                continue
+            for j in range(col, n):
+                m[row][j] -= factor * m[col][j]
+
+    return det * sign
+
+
+def dense_equal(a: List[List[float]], b: List[List[float]], eps: float = EPS) -> bool:
+    if len(a) != len(b):
+        return False
+    if a and b and len(a[0]) != len(b[0]):
+        return False
+    for r in range(len(a)):
+        for c in range(len(a[0])):
+            if abs(a[r][c] - b[r][c]) > eps:
+                return False
+    return True
+
+
+def format_dense(dense: List[List[float]]) -> str:
+    if not dense:
+        return "[]"
+    return "\n".join(" ".join(f"{x:10.5g}" for x in row) for row in dense)
+
+
+def fmt_entries(rows: int, cols: int, entries: Dict[Tuple[int, int], float]) -> str:
+    dense = entries_to_dense(rows, cols, entries)
+    return format_dense(dense)
+
+
+# =========================
+# Matrix Market IO
+# =========================
+
+@dataclass
+class MatrixSpec:
+    rows: int
+    cols: int
+    dense: List[List[float]]
+    format_kind: str  # "array" or "coordinate"
+    field_kind: str   # "real" or "integer"
+    duplicate_mode: bool = False
+    explicit_zero_mode: bool = False
+    shuffle_coordinate_lines: bool = False
+
+
+def write_degree(path: Path, degree: int) -> None:
+    path.write_text(f"{degree}\n", encoding="utf-8")
+
+
+def write_broken_degree(path: Path, text: str) -> None:
+    path.write_text(text, encoding="utf-8")
+
+
+def make_matrix_text(spec: MatrixSpec, rng: random.Random) -> str:
+    lines: List[str] = []
+    lines.append(f"%%MatrixMarket matrix {spec.format_kind} {spec.field_kind} general")
+    lines.append("% generated by test harness")
+
+    dense = spec.dense
+    rows = spec.rows
+    cols = spec.cols
+
+    if spec.format_kind == "array":
+        lines.append(f"{rows} {cols}")
+        for c in range(cols):
+            for r in range(rows):
+                value = dense[r][c]
+                if spec.field_kind == "integer":
+                    lines.append(str(int(round(value))))
+                else:
+                    lines.append(f"{value:.9g}")
+        return "\n".join(lines) + "\n"
+
+    entries: List[Tuple[int, int, float]] = []
+    for r in range(rows):
+        for c in range(cols):
+            v = dense[r][c]
+            if not is_zero(v):
+                if spec.duplicate_mode:
+                    # Split value into 2-3 pieces that sum back to v.
+                    pieces = 2 if rng.random() < 0.65 else 3
+                    if spec.field_kind == "integer":
+                        iv = int(round(v))
+                        if pieces == 2:
+                            a = rng.randint(-3, 3)
+                            b = iv - a
+                            split = [a, b]
+                        else:
+                            a = rng.randint(-3, 3)
+                            b = rng.randint(-3, 3)
+                            c3 = iv - a - b
+                            split = [a, b, c3]
+                        for part in split:
+                            entries.append((r + 1, c + 1, float(part)))
+                    else:
+                        if pieces == 2:
+                            a = v * 0.37
+                            b = v - a
+                            split = [a, b]
+                        else:
+                            a = v * 0.17
+                            b = v * -0.23
+                            c3 = v - a - b
+                            split = [a, b, c3]
+                        for part in split:
+                            entries.append((r + 1, c + 1, part))
+                else:
+                    entries.append((r + 1, c + 1, v))
+
+    if spec.explicit_zero_mode:
+        zero_injections = max(1, (rows * cols) // 7)
+        for _ in range(zero_injections):
+            rr = rng.randint(1, rows)
+            cc = rng.randint(1, cols)
+            entries.append((rr, cc, 0.0))
+
+    if spec.shuffle_coordinate_lines:
+        rng.shuffle(entries)
+
+    lines.append(f"{rows} {cols} {len(entries)}")
+    for r, c, v in entries:
+        if spec.field_kind == "integer":
+            lines.append(f"{r} {c} {int(round(v))}")
+        else:
+            lines.append(f"{r} {c} {v:.9g}")
+    return "\n".join(lines) + "\n"
+
+
+def write_matrix_file(path: Path, spec: MatrixSpec, rng: random.Random) -> None:
+    path.write_text(make_matrix_text(spec, rng), encoding="utf-8")
+
+
+def parse_output_matrix(text: str) -> Tuple[int, int, Dict[Tuple[int, int], float], List[str]]:
+    """
+    Returns: rows, cols, aggregated entries, structural warnings
+    """
+    warnings: List[str] = []
+    stripped = text.strip()
+    if not stripped:
+        raise ValueError("empty output")
+
+    lines = [line.rstrip("\n\r") for line in text.splitlines() if line.strip() != ""]
+    if not lines:
+        raise ValueError("empty output")
+
+    header = lines[0]
+    if header != "%%MatrixMarket matrix coordinate real general":
+        raise ValueError(f"bad header: {header!r}")
+
+    if len(lines) < 2:
+        raise ValueError("missing size line")
+
+    parts = lines[1].split()
+    if len(parts) != 3:
+        raise ValueError(f"bad size line: {lines[1]!r}")
+
+    rows, cols, declared_nnz = map(int, parts)
+    raw_entries: List[Tuple[int, int, float]] = []
+    for line in lines[2:]:
+        p = line.split()
+        if len(p) != 3:
+            raise ValueError(f"bad coordinate line: {line!r}")
+        r = int(p[0])
+        c = int(p[1])
+        v = float(p[2])
+        if not (1 <= r <= rows and 1 <= c <= cols):
+            raise ValueError(f"coordinate out of bounds: {line!r}")
+        raw_entries.append((r - 1, c - 1, v))
+
+    if declared_nnz != len(raw_entries):
+        warnings.append(f"declared nnz = {declared_nnz}, but actual lines = {len(raw_entries)}")
+
+    seen = set()
+    entries: Dict[Tuple[int, int], float] = {}
+    for r, c, v in raw_entries:
+        key = (r, c)
+
+        if key in seen:
+            warnings.append(f"duplicate coordinate in output: ({r+1}, {c+1})")
+        seen.add(key)
+
+        if is_zero(v):
+            warnings.append(f"explicit zero in output: ({r+1}, {c+1})")
+        entries[key] = entries.get(key, 0.0) + v
+
+    entries = canonicalize_entries(entries)
+    return rows, cols, entries, warnings
+
+
+# =========================
+# Program runner
+# =========================
+
+@dataclass
+class RunResult:
+    returncode: int
+    stdout: str
+    stderr: str
+    output_exists: bool
+    output_text: str
+
+
+def run_program(exe: Path, args: List[str], cwd: Path) -> RunResult:
+    completed = subprocess.run(
+        [str(exe)] + args,
+        cwd=str(cwd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    output_path = cwd / args[1] if len(args) >= 2 else None
+    output_exists = bool(output_path and output_path.exists())
+    output_text = output_path.read_text(encoding="utf-8", errors="replace") if output_exists else ""
+
+    return RunResult(
+        returncode=completed.returncode,
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+        output_exists=output_exists,
+        output_text=output_text,
+    )
+
+
+# =========================
+# Test framework
+# =========================
+
+@dataclass
+class TestCase:
+    name: str
+    kind: str  # "ok_matrix", "ok_scalar", "no_solution", "bad_input"
+    op: str
+    mat1: MatrixSpec = None
+    mat2: MatrixSpec = None
+    degree: int = None
+    broken_degree_text: str = None
+    expected_matrix: List[List[float]] = None
+    expected_scalar: float = None
+    expect_output_file: bool = True
+    notes: str = ""
+    strict_structure: bool = True
+
+
+@dataclass
+class TestReport:
+    case: TestCase
+    passed: bool
+    message: str
+
+
+def make_random_dense(rows: int, cols: int, rng: random.Random, density: float, integer: bool) -> List[List[float]]:
+    dense = [[0.0 for _ in range(cols)] for _ in range(rows)]
+    for r in range(rows):
+        for c in range(cols):
+            if rng.random() <= density:
+                if integer:
+                    dense[r][c] = float(rng.randint(-5, 5))
+                else:
+                    value = rng.uniform(-5.0, 5.0)
+                    dense[r][c] = round(value, 3)
+    return dense
+
+
+def build_spec_from_dense(
+    dense: List[List[float]],
+    fmt: str,
+    field: str,
+    *,
+    duplicate_mode: bool = False,
+    explicit_zero_mode: bool = False,
+    shuffle_coordinate_lines: bool = False,
+) -> MatrixSpec:
+    return MatrixSpec(
+        rows=len(dense),
+        cols=len(dense[0]) if dense else 0,
+        dense=[row[:] for row in dense],
+        format_kind=fmt,
+        field_kind=field,
+        duplicate_mode=duplicate_mode,
+        explicit_zero_mode=explicit_zero_mode,
+        shuffle_coordinate_lines=shuffle_coordinate_lines,
+    )
+
+
+def execute_case(case: TestCase, exe: Path, root: Path) -> TestReport:
+    case_dir = root / sanitize_name(case.name)
+    case_dir.mkdir(parents=True, exist_ok=True)
+
+    in1 = case_dir / "input1.mtx"
+    out = case_dir / "output.txt"
+    rng = random.Random(abs(hash(case.name)) % (2**32))
+
+    if case.mat1 is not None:
+        write_matrix_file(in1, case.mat1, rng)
+
+    args = [case.op, out.name, in1.name]
+
+    if case.op in {"+", "-", "*"}:
+        in2 = case_dir / "input2.mtx"
+        write_matrix_file(in2, case.mat2, rng)
+        args.append(in2.name)
+    elif case.op == "^":
+        deg_file = case_dir / "degree.txt"
+        if case.broken_degree_text is not None:
+            write_broken_degree(deg_file, case.broken_degree_text)
+        else:
+            write_degree(deg_file, case.degree)
+        args.append(deg_file.name)
+
+    result = run_program(exe, args, case_dir)
+
+    if case.kind == "bad_input":
+        if result.returncode == 0:
+            return TestReport(case, False, f"expected non-zero return code, got 0\nstderr:\n{result.stderr}")
+        if not result.stderr.strip():
+            return TestReport(case, False, "expected non-empty stderr for bad input, but stderr is empty")
+        return TestReport(case, True, "ok")
+
+    if case.kind == "no_solution":
+        if result.returncode != 0:
+            return TestReport(case, False, f"expected return code 0 with 'no solution', got {result.returncode}\nstderr:\n{result.stderr}")
+        if not result.output_exists:
+            return TestReport(case, False, "expected output file with 'no solution', but output file is missing")
+        if result.output_text.strip() != "no solution":
+            return TestReport(case, False, f"expected output 'no solution', got:\n{result.output_text}")
+        return TestReport(case, True, "ok")
+
+    if result.returncode != 0:
+        return TestReport(case, False, f"expected return code 0, got {result.returncode}\nstderr:\n{result.stderr}")
+
+    if not result.output_exists:
+        return TestReport(case, False, "output file is missing")
+
+    if case.kind == "ok_scalar":
+        text = result.output_text.strip()
+        try:
+            got = float(text)
+        except ValueError:
+            return TestReport(case, False, f"expected scalar float output, got:\n{result.output_text}")
+        if abs(got - case.expected_scalar) > EPS:
+            return TestReport(case, False, f"wrong determinant\nexpected: {case.expected_scalar}\ngot:      {got}")
+        return TestReport(case, True, "ok")
+
+    if case.kind == "ok_matrix":
+        try:
+            rows, cols, got_entries, warnings = parse_output_matrix(result.output_text)
+        except Exception as exc:
+            return TestReport(case, False, f"failed to parse matrix output: {exc}\noutput:\n{result.output_text}")
+
+        expected_rows = len(case.expected_matrix)
+        expected_cols = len(case.expected_matrix[0]) if case.expected_matrix else 0
+        expected_entries = dense_to_entries(case.expected_matrix)
+
+        if rows != expected_rows or cols != expected_cols:
+            return TestReport(
+                case,
+                False,
+                f"wrong output dimensions\nexpected: {expected_rows} x {expected_cols}\ngot:      {rows} x {cols}"
+            )
+
+        got_dense = entries_to_dense(rows, cols, got_entries)
+        if not dense_equal(got_dense, case.expected_matrix):
+            return TestReport(
+                case,
+                False,
+                "wrong matrix result\n"
+                f"expected:\n{format_dense(case.expected_matrix)}\n\n"
+                f"got:\n{format_dense(got_dense)}\n\n"
+                f"raw output:\n{result.output_text}"
+            )
+
+        if case.strict_structure and warnings:
+            return TestReport(case, False, "structural output issues:\n- " + "\n- ".join(warnings))
+
+        return TestReport(case, True, "ok")
+
+    return TestReport(case, False, f"unknown test kind: {case.kind}")
+
+
+def sanitize_name(name: str) -> str:
+    safe = []
+    for ch in name:
+        if ch.isalnum() or ch in ("-", "_"):
+            safe.append(ch)
+        else:
+            safe.append("_")
+    return "".join(safe)
+
+
+# =========================
+# Test generation
+# =========================
+
+def generate_tests(seed: int) -> List[TestCase]:
+    rng = random.Random(seed)
+    tests: List[TestCase] = []
+
+    # ---- Deterministic small cases ----
+
+    zero_2x3 = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+    a23 = [[1.0, 2.0, 0.0], [0.0, -3.0, 4.0]]
+    b23 = [[5.0, 0.0, 7.0], [0.0, 3.0, -4.0]]
+    a32 = [[1.0, 2.0], [0.0, 1.0], [3.0, 0.0]]
+    b24 = [[1.0, 0.0, 2.0, 0.0], [0.0, 1.0, 0.0, -1.0]]
+    sq3 = [[2.0, 1.0, 0.0], [0.0, -1.0, 3.0], [4.0, 0.0, 2.0]]
+    id3 = mat_eye(3)
+
+    tests.extend([
+        TestCase(
+            name="add_basic_array_plus_coordinate",
+            kind="ok_matrix",
+            op="+",
+            mat1=build_spec_from_dense(a23, "array", "real"),
+            mat2=build_spec_from_dense(b23, "coordinate", "real"),
+            expected_matrix=mat_add(a23, b23),
+        ),
+        TestCase(
+            name="subtract_basic_coordinate_minus_array",
+            kind="ok_matrix",
+            op="-",
+            mat1=build_spec_from_dense(a23, "coordinate", "real"),
+            mat2=build_spec_from_dense(b23, "array", "real"),
+            expected_matrix=mat_sub(a23, b23),
+        ),
+        TestCase(
+            name="add_all_zero_matrices",
+            kind="ok_matrix",
+            op="+",
+            mat1=build_spec_from_dense(zero_2x3, "array", "real"),
+            mat2=build_spec_from_dense(zero_2x3, "coordinate", "real"),
+            expected_matrix=mat_add(zero_2x3, zero_2x3),
+        ),
+        TestCase(
+            name="multiply_rectangular_basic",
+            kind="ok_matrix",
+            op="*",
+            mat1=build_spec_from_dense(a32, "coordinate", "real"),
+            mat2=build_spec_from_dense(b24, "array", "real"),
+            expected_matrix=mat_mul(a32, b24),
+        ),
+        TestCase(
+            name="multiply_by_identity",
+            kind="ok_matrix",
+            op="*",
+            mat1=build_spec_from_dense(sq3, "array", "real"),
+            mat2=build_spec_from_dense(id3, "coordinate", "integer"),
+            expected_matrix=mat_mul(sq3, id3),
+        ),
+        TestCase(
+            name="power_degree_0",
+            kind="ok_matrix",
+            op="^",
+            mat1=build_spec_from_dense(sq3, "coordinate", "real"),
+            degree=0,
+            expected_matrix=mat_eye(3),
+        ),
+        TestCase(
+            name="power_degree_1",
+            kind="ok_matrix",
+            op="^",
+            mat1=build_spec_from_dense(sq3, "array", "real"),
+            degree=1,
+            expected_matrix=[row[:] for row in sq3],
+        ),
+        TestCase(
+            name="power_degree_5",
+            kind="ok_matrix",
+            op="^",
+            mat1=build_spec_from_dense([[1.0, 1.0], [1.0, 0.0]], "coordinate", "integer"),
+            degree=5,
+            expected_matrix=mat_pow([[1.0, 1.0], [1.0, 0.0]], 5),
+        ),
+        TestCase(
+            name="determinant_1x1",
+            kind="ok_scalar",
+            op="|",
+            mat1=build_spec_from_dense([[7.0]], "coordinate", "integer"),
+            expected_scalar=7.0,
+        ),
+        TestCase(
+            name="determinant_2x2",
+            kind="ok_scalar",
+            op="|",
+            mat1=build_spec_from_dense([[1.0, 2.0], [3.0, 4.0]], "array", "integer"),
+            expected_scalar=mat_det([[1.0, 2.0], [3.0, 4.0]]),
+        ),
+        TestCase(
+            name="determinant_3x3",
+            kind="ok_scalar",
+            op="|",
+            mat1=build_spec_from_dense(sq3, "coordinate", "real"),
+            expected_scalar=mat_det(sq3),
+        ),
+    ])
+
+    # ---- Shape mismatch / no solution ----
+
+    tests.extend([
+        TestCase(
+            name="add_no_solution_shape_mismatch",
+            kind="no_solution",
+            op="+",
+            mat1=build_spec_from_dense([[1.0, 2.0]], "array", "real"),
+            mat2=build_spec_from_dense([[1.0], [2.0]], "coordinate", "real"),
+        ),
+        TestCase(
+            name="subtract_no_solution_shape_mismatch",
+            kind="no_solution",
+            op="-",
+            mat1=build_spec_from_dense([[1.0, 2.0, 3.0]], "array", "real"),
+            mat2=build_spec_from_dense([[4.0, 5.0]], "array", "real"),
+        ),
+        TestCase(
+            name="multiply_no_solution_shape_mismatch",
+            kind="no_solution",
+            op="*",
+            mat1=build_spec_from_dense([[1.0, 2.0, 3.0]], "coordinate", "real"),
+            mat2=build_spec_from_dense([[1.0, 2.0], [3.0, 4.0]], "coordinate", "real"),
+        ),
+        TestCase(
+            name="determinant_no_solution_rectangular",
+            kind="no_solution",
+            op="|",
+            mat1=build_spec_from_dense([[1.0, 2.0, 3.0], [0.0, 1.0, 0.0]], "array", "real"),
+        ),
+        TestCase(
+            name="power_no_solution_rectangular_degree_2",
+            kind="no_solution",
+            op="^",
+            mat1=build_spec_from_dense([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], "array", "real"),
+            degree=2,
+        ),
+    ])
+
+    # ---- Parser stress on valid mathematical inputs ----
+    # These tests are especially useful because they reveal structural/output issues too.
+
+    dup_base = [[4.0, 0.0], [0.0, -3.0]]
+    tests.extend([
+        TestCase(
+            name="add_coordinate_duplicates_should_still_work",
+            kind="ok_matrix",
+            op="+",
+            mat1=build_spec_from_dense(dup_base, "coordinate", "integer", duplicate_mode=True, shuffle_coordinate_lines=True),
+            mat2=build_spec_from_dense([[1.0, 2.0], [3.0, 4.0]], "coordinate", "integer", duplicate_mode=True, explicit_zero_mode=True, shuffle_coordinate_lines=True),
+            expected_matrix=mat_add(dup_base, [[1.0, 2.0], [3.0, 4.0]]),
+        ),
+        TestCase(
+            name="multiply_coordinate_duplicates_and_zeros",
+            kind="ok_matrix",
+            op="*",
+            mat1=build_spec_from_dense([[1.0, 2.0], [0.0, 3.0]], "coordinate", "integer", duplicate_mode=True, explicit_zero_mode=True, shuffle_coordinate_lines=True),
+            mat2=build_spec_from_dense([[4.0, 0.0], [5.0, 6.0]], "coordinate", "integer", duplicate_mode=True, explicit_zero_mode=True, shuffle_coordinate_lines=True),
+            expected_matrix=mat_mul([[1.0, 2.0], [0.0, 3.0]], [[4.0, 0.0], [5.0, 6.0]]),
+        ),
+        TestCase(
+            name="determinant_coordinate_duplicates_and_zeros",
+            kind="ok_scalar",
+            op="|",
+            mat1=build_spec_from_dense([[2.0, 1.0], [3.0, 4.0]], "coordinate", "integer", duplicate_mode=True, explicit_zero_mode=True, shuffle_coordinate_lines=True),
+            expected_scalar=mat_det([[2.0, 1.0], [3.0, 4.0]]),
+        ),
+        TestCase(
+            name="power_degree_1_with_coordinate_duplicates",
+            kind="ok_matrix",
+            op="^",
+            mat1=build_spec_from_dense([[2.0, 0.0], [0.0, 5.0]], "coordinate", "integer", duplicate_mode=True, explicit_zero_mode=True, shuffle_coordinate_lines=True),
+            degree=1,
+            expected_matrix=[[2.0, 0.0], [0.0, 5.0]],
+        ),
+    ])
+
+    # ---- Bad input tests ----
+
+    tests.extend([
+        make_bad_header_test(),
+        make_bad_size_line_test(),
+        make_bad_coordinate_out_of_range_test(),
+        make_bad_zero_dimension_test(),
+        make_bad_degree_test(),
+    ])
+
+    # ---- Random valid tests ----
+
+    formats = ["array", "coordinate"]
+    fields = ["real", "integer"]
+
+    # Add/Subtract
+    for i in range(60):
+        rows = rng.randint(1, 6)
+        cols = rng.randint(1, 6)
+        int_mode = rng.random() < 0.45
+        field = "integer" if int_mode else "real"
+        density_a = rng.uniform(0.15, 0.8)
+        density_b = rng.uniform(0.15, 0.8)
+
+        a = make_random_dense(rows, cols, rng, density_a, int_mode)
+        b = make_random_dense(rows, cols, rng, density_b, int_mode)
+
+        fmt1 = rng.choice(formats)
+        fmt2 = rng.choice(formats)
+        dup1 = fmt1 == "coordinate" and rng.random() < 0.25
+        dup2 = fmt2 == "coordinate" and rng.random() < 0.25
+        zero1 = fmt1 == "coordinate" and rng.random() < 0.25
+        zero2 = fmt2 == "coordinate" and rng.random() < 0.25
+        shuf1 = fmt1 == "coordinate" and rng.random() < 0.5
+        shuf2 = fmt2 == "coordinate" and rng.random() < 0.5
+
+        tests.append(TestCase(
+            name=f"random_add_{i:03d}",
+            kind="ok_matrix",
+            op="+",
+            mat1=build_spec_from_dense(a, fmt1, field, duplicate_mode=dup1, explicit_zero_mode=zero1, shuffle_coordinate_lines=shuf1),
+            mat2=build_spec_from_dense(b, fmt2, field, duplicate_mode=dup2, explicit_zero_mode=zero2, shuffle_coordinate_lines=shuf2),
+            expected_matrix=mat_add(a, b),
+        ))
+        tests.append(TestCase(
+            name=f"random_sub_{i:03d}",
+            kind="ok_matrix",
+            op="-",
+            mat1=build_spec_from_dense(a, fmt1, field, duplicate_mode=dup1, explicit_zero_mode=zero1, shuffle_coordinate_lines=shuf1),
+            mat2=build_spec_from_dense(b, fmt2, field, duplicate_mode=dup2, explicit_zero_mode=zero2, shuffle_coordinate_lines=shuf2),
+            expected_matrix=mat_sub(a, b),
+        ))
+
+    # Multiply
+    for i in range(60):
+        rows = rng.randint(1, 5)
+        inner = rng.randint(1, 5)
+        cols = rng.randint(1, 5)
+        int_mode = rng.random() < 0.45
+        field = "integer" if int_mode else "real"
+        a = make_random_dense(rows, inner, rng, rng.uniform(0.15, 0.7), int_mode)
+        b = make_random_dense(inner, cols, rng, rng.uniform(0.15, 0.7), int_mode)
+
+        fmt1 = rng.choice(formats)
+        fmt2 = rng.choice(formats)
+        tests.append(TestCase(
+            name=f"random_mul_{i:03d}",
+            kind="ok_matrix",
+            op="*",
+            mat1=build_spec_from_dense(
+                a, fmt1, field,
+                duplicate_mode=(fmt1 == "coordinate" and rng.random() < 0.25),
+                explicit_zero_mode=(fmt1 == "coordinate" and rng.random() < 0.25),
+                shuffle_coordinate_lines=(fmt1 == "coordinate" and rng.random() < 0.5),
+            ),
+            mat2=build_spec_from_dense(
+                b, fmt2, field,
+                duplicate_mode=(fmt2 == "coordinate" and rng.random() < 0.25),
+                explicit_zero_mode=(fmt2 == "coordinate" and rng.random() < 0.25),
+                shuffle_coordinate_lines=(fmt2 == "coordinate" and rng.random() < 0.5),
+            ),
+            expected_matrix=mat_mul(a, b),
+        ))
+
+    # Power
+    for i in range(30):
+        n = rng.randint(1, 4)
+        int_mode = rng.random() < 0.5
+        field = "integer" if int_mode else "real"
+        a = make_random_dense(n, n, rng, rng.uniform(0.2, 0.8), int_mode)
+        degree = rng.randint(0, 7)
+        fmt = rng.choice(formats)
+        tests.append(TestCase(
+            name=f"random_pow_{i:03d}",
+            kind="ok_matrix",
+            op="^",
+            mat1=build_spec_from_dense(
+                a, fmt, field,
+                duplicate_mode=(fmt == "coordinate" and rng.random() < 0.25),
+                explicit_zero_mode=(fmt == "coordinate" and rng.random() < 0.25),
+                shuffle_coordinate_lines=(fmt == "coordinate" and rng.random() < 0.5),
+            ),
+            degree=degree,
+            expected_matrix=mat_pow(a, degree),
+        ))
+
+    # Determinant
+    for i in range(40):
+        n = rng.randint(1, 5)
+        int_mode = True  # integer matrices are nicer here and stable numerically
+        field = "integer"
+        a = make_random_dense(n, n, rng, rng.uniform(0.25, 0.9), int_mode)
+        fmt = rng.choice(formats)
+        tests.append(TestCase(
+            name=f"random_det_{i:03d}",
+            kind="ok_scalar",
+            op="|",
+            mat1=build_spec_from_dense(
+                a, fmt, field,
+                duplicate_mode=(fmt == "coordinate" and rng.random() < 0.30),
+                explicit_zero_mode=(fmt == "coordinate" and rng.random() < 0.25),
+                shuffle_coordinate_lines=(fmt == "coordinate" and rng.random() < 0.5),
+            ),
+            expected_scalar=mat_det(a),
+        ))
+
+    return tests
+
+
+def make_bad_header_test() -> TestCase:
+    bad = TestCase(
+        name="bad_input_header",
+        kind="bad_input",
+        op="|",
+        mat1=build_spec_from_dense([[1.0]], "array", "real"),
+        expected_scalar=0.0,
+    )
+    # We override by writing malformed file during execution.
+    bad.notes = "custom malformed header"
+    return bad
+
+
+def make_bad_size_line_test() -> TestCase:
+    bad = TestCase(
+        name="bad_input_size_line",
+        kind="bad_input",
+        op="|",
+        mat1=build_spec_from_dense([[1.0]], "array", "real"),
+        expected_scalar=0.0,
+    )
+    bad.notes = "custom malformed size line"
+    return bad
+
+
+def make_bad_coordinate_out_of_range_test() -> TestCase:
+    bad = TestCase(
+        name="bad_input_coordinate_out_of_range",
+        kind="bad_input",
+        op="|",
+        mat1=build_spec_from_dense([[1.0]], "coordinate", "real"),
+        expected_scalar=0.0,
+    )
+    bad.notes = "custom bad coordinate bounds"
+    return bad
+
+
+def make_bad_zero_dimension_test() -> TestCase:
+    bad = TestCase(
+        name="bad_input_zero_dimension",
+        kind="bad_input",
+        op="|",
+        mat1=build_spec_from_dense([[1.0]], "array", "real"),
+        expected_scalar=0.0,
+    )
+    bad.notes = "custom zero dimension"
+    return bad
+
+
+def make_bad_degree_test() -> TestCase:
+    bad = TestCase(
+        name="bad_input_degree_file",
+        kind="bad_input",
+        op="^",
+        mat1=build_spec_from_dense([[1.0, 2.0], [3.0, 4.0]], "array", "real"),
+        broken_degree_text="abc\n",
+        expected_matrix=[[0.0]],
+    )
+    bad.notes = "broken degree file"
+    return bad
+
+
+def execute_bad_input_custom(case: TestCase, exe: Path, root: Path) -> TestReport:
+    case_dir = root / sanitize_name(case.name)
+    case_dir.mkdir(parents=True, exist_ok=True)
+
+    in1 = case_dir / "input1.mtx"
+    out = case_dir / "output.txt"
+
+    if case.name == "bad_input_header":
+        in1.write_text(
+            "%%MatrixMarket matrix arr real general\n"
+            "1 1\n"
+            "5\n",
+            encoding="utf-8",
+        )
+        args = ["|", out.name, in1.name]
+
+    elif case.name == "bad_input_size_line":
+        in1.write_text(
+            "%%MatrixMarket matrix array real general\n"
+            "wrong size line\n"
+            "5\n",
+            encoding="utf-8",
+        )
+        args = ["|", out.name, in1.name]
+
+    elif case.name == "bad_input_coordinate_out_of_range":
+        in1.write_text(
+            "%%MatrixMarket matrix coordinate real general\n"
+            "2 2 1\n"
+            "3 1 5\n",
+            encoding="utf-8",
+        )
+        args = ["|", out.name, in1.name]
+
+    elif case.name == "bad_input_zero_dimension":
+        in1.write_text(
+            "%%MatrixMarket matrix array real general\n"
+            "0 3\n",
+            encoding="utf-8",
+        )
+        args = ["|", out.name, in1.name]
+
+    elif case.name == "bad_input_degree_file":
+        write_matrix_file(in1, case.mat1, random.Random(1))
+        deg_file = case_dir / "degree.txt"
+        write_broken_degree(deg_file, case.broken_degree_text)
+        args = ["^", out.name, in1.name, deg_file.name]
+
+    else:
+        return TestReport(case, False, f"unsupported custom bad input case: {case.name}")
+
+    result = run_program(exe, args, case_dir)
+    if result.returncode == 0:
+        return TestReport(case, False, f"expected non-zero return code, got 0\nstderr:\n{result.stderr}")
+    if not result.stderr.strip():
+        return TestReport(case, False, "expected non-empty stderr for bad input, but stderr is empty")
+    return TestReport(case, True, "ok")
+
+
+# =========================
+# Main
+# =========================
+
+def print_banner(exe: Path, seed: int) -> None:
+    print("=" * 80)
+    print("Sparse Matrix test harness")
+    print(f"Executable : {exe}")
+    print(f"Seed       : {seed}")
+    print(f"EPS        : {EPS}")
+    print("=" * 80)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Large end-to-end test suite for sparse matrix executable")
+    parser.add_argument("--exe", default="a.exe", help="Path to executable (default: a.exe)")
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Random seed")
+    parser.add_argument("--keep", action="store_true", help="Keep temporary test directory")
+    args = parser.parse_args()
+
+    exe = Path(args.exe)
+    if not exe.exists():
+        print(f"ERROR: executable not found: {exe}", file=sys.stderr)
+        return 2
+
+    print_banner(exe.resolve(), args.seed)
+
+    tests = generate_tests(args.seed)
+    passed = 0
+    failed_reports: List[TestReport] = []
+
+    root_ctx = tempfile.TemporaryDirectory(prefix="sparse_matrix_tests_")
+    root = Path(root_ctx.name)
+
+    try:
+        for idx, case in enumerate(tests, start=1):
+            if case.kind == "bad_input" and case.notes.startswith("custom"):
+                report = execute_bad_input_custom(case, exe.resolve(), root)
+            else:
+                report = execute_case(case, exe.resolve(), root)
+
+            status = "PASS" if report.passed else "FAIL"
+            print(f"[{idx:03d}/{len(tests):03d}] {status}  {case.name}")
+
+            if report.passed:
+                passed += 1
+            else:
+                failed_reports.append(report)
+
+        print("\n" + "=" * 80)
+        print(f"Total tests : {len(tests)}")
+        print(f"Passed      : {passed}")
+        print(f"Failed      : {len(failed_reports)}")
+        print("=" * 80)
+
+        if failed_reports:
+            print("\nDetailed failures:\n")
+            for report in failed_reports:
+                print("-" * 80)
+                print(report.case.name)
+                print(report.message)
+                print("-" * 80)
+            print(f"\nArtifacts kept in: {root}")
+            if args.keep:
+                print("Temporary directory preserved because --keep was set.")
+                root_ctx.cleanup = lambda: None  # type: ignore[attr-defined]
+            return 1
+
+        if args.keep:
+            print(f"\nAll tests passed. Temporary directory preserved at: {root}")
+            root_ctx.cleanup = lambda: None  # type: ignore[attr-defined]
+        else:
+            print("\nAll tests passed.")
+        return 0
+
+    finally:
+        if args.keep:
+            pass
+        else:
+            root_ctx.cleanup()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

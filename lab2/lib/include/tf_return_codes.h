@@ -1,0 +1,12 @@
+#pragma once
+
+typedef enum TFReturnCodes
+{
+	TF_SUCCESS = 0,
+	TF_ERROR_OPEN_FILE = 1,
+	TF_MEMORY_ERROR = 2,
+	TF_DATA_INVALID = 3,
+	TF_INPUT_INVALID = 4,
+	TF_UNSUPPORTED_TYPE = 5,
+	TF_WRITE_ERROR = 6,
+} TFReturnCode;

@@ -1,0 +1,4 @@
+C:/Users/Фёдор/Desktop/Study/cpp/lab4/build-clang/CMakeFiles/lab4_tests.dir
+C:/Users/Фёдор/Desktop/Study/cpp/lab4/build-clang/CMakeFiles/test.dir
+C:/Users/Фёдор/Desktop/Study/cpp/lab4/build-clang/CMakeFiles/edit_cache.dir
+C:/Users/Фёдор/Desktop/Study/cpp/lab4/build-clang/CMakeFiles/rebuild_cache.dir

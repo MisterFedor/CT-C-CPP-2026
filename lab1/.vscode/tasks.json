@@ -1,0 +1,25 @@
+{
+    "tasks": [
+        {
+            "type": "cppbuild",
+            "label": "C/C++: clang.exe build active file",
+            "command": "C:\\Program Files\\LLVM\\bin\\clang.exe",
+            "args": [
+                "*.c",
+                "-std=c17",
+                "-g",
+                 "-D_CRT_SECURE_NO_WARNINGS",
+                "-o",
+                "${workspaceFolder}/a.exe",
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        }
+    ],
+    "version": "2.0.0"
+}
